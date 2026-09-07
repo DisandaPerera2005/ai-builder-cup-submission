@@ -1,0 +1,53 @@
+# Settings for Backend (on Cloud Run).
+# See https://firebase.google.com/docs/app-hosting/configure#cloud-run
+runConfig:
+  minInstances: 0
+  # maxInstances: 100
+  # concurrency: 80
+  # cpu: 1
+  # memoryMiB: 512
+
+# Environment variables and secrets.
+env:
+  # fello-backend/backend proxy (GCE VM fello-gateway) — the only thing the
+  # server side calls for WhatsApp linking/messaging. Never exposed to the
+  # browser (no NEXT_PUBLIC_ prefix), RUNTIME only since it's read inside API
+  # routes / server actions, not needed at build time.
+  - variable: BACKEND_API_URL
+    value: http://136.64.215.81:8080
+    availability:
+      - RUNTIME
+
+  # Deployed ADK agent (fello-agent/deploy.py) on Vertex AI Agent Engine.
+  # Same gitignored-.env.local trap as BACKEND_API_URL above — without this,
+  # agentEngineConfigured() is false in production and the chat route falls
+  # back to the direct-NIM path, which errors without NVIDIA_API_KEY set.
+  - variable: AGENT_ENGINE_RESOURCE_NAME
+    value: projects/181789735145/locations/us-central1/reasoningEngines/6604931824550412288
+    availability:
+      - RUNTIME
+
+  # Google OAuth client for the Drive/Gmail/Forms/Calendar connect flow
+  # (lib/google.ts, app/api/auth/google/route.ts + callback). These live in
+  # .env.local locally, which is gitignored and never deployed here — without
+  # them process.env.GOOGLE_OAUTH_CLIENT_ID is undefined in prod, so Google
+  # rejects the auth request with "Error 401: invalid_client".
+  - variable: GOOGLE_OAUTH_CLIENT_ID
+    value: 181789735145-n1llpo3bodrl1bhmqq395n3inoghusdd.apps.googleusercontent.com
+    availability:
+      - RUNTIME
+
+  - variable: GOOGLE_OAUTH_CLIENT_SECRET
+    secret: google-oauth-client-secret
+    availability:
+      - RUNTIME
+
+  # Used by app/api/auth/google/route.ts to build the OAuth redirect_uri.
+  # Without this, getAppUrl() falls back to its localhost default, so prod
+  # sends redirect_uri=http://localhost:3000/... to Google, which doesn't
+  # match anything registered for app.fello.live -> Error 400: redirect_uri_mismatch.
+  - variable: NEXT_PUBLIC_APP_URL
+    value: https://app.fello.live
+    availability:
+      - BUILD
+      - RUNTIME

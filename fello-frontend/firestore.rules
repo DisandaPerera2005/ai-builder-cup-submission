@@ -1,0 +1,265 @@
+rules_version='2'
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ---- helpers -----------------------------------------------------
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function claims() {
+      return request.auth.token;
+    }
+
+    // Full org access (member of this org at all) via custom claims.
+    function isOrgMember(orgId) {
+      return signedIn() && ('orgs' in claims()) && (orgId in claims().orgs);
+    }
+
+    // event_only (external contributor) access to exactly this project.
+    function isProjectGuest(projectId) {
+      return signedIn() && ('projects' in claims()) && (projectId in claims().projects);
+    }
+
+    // True once the actor has SOME verified access to this project: either a
+    // full member of its org, or an invited guest scoped to it.
+    function canAccessProject(orgId, projectId) {
+      return isOrgMember(orgId) || isProjectGuest(projectId);
+    }
+
+    function isSelf(uid) {
+      return signedIn() && request.auth.uid == uid;
+    }
+
+    // Admin access on this org — required for anything that can change who is
+    // in the org or touch its connected Google account. The app writes
+    // access:"owner" on org creation (lib/actions/organizations.ts) and
+    // capabilitiesFor() treats full/owner/admin as equivalent — mirror that.
+    function isOrgAdmin(orgId) {
+      return isOrgMember(orgId) &&
+        claims().orgs[orgId].access in ['full', 'owner', 'admin'];
+    }
+
+    // Admin or coordinator — required for membership/member/structure writes.
+    function isOrgManager(orgId) {
+      return isOrgMember(orgId) &&
+        claims().orgs[orgId].access in ['full', 'owner', 'admin', 'coordinator'];
+    }
+
+    // True if orgId is listed on the caller's own user doc — covers the
+    // brief pre-claims window (org selector, right after joining/creating an
+    // org) before a fresh ID token with updated `orgs` claims is issued.
+    function isListedOnUser(orgId) {
+      return signedIn() &&
+        exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
+        ('organizations' in get(/databases/$(database)/documents/users/$(request.auth.uid)).data) &&
+        (orgId in get(/databases/$(database)/documents/users/$(request.auth.uid)).data.organizations);
+    }
+
+    // ---- users ---------------------------------------------------------
+    match /users/{uid} {
+      // Members and project pages read org-mates' user docs for names/avatars
+      // (members/page.tsx, projects/[projectId]/page.tsx) — allow reading a
+      // profile when the caller shares at least one org with its owner.
+      allow read: if isSelf(uid) ||
+        (signedIn() && ('orgs' in claims()) &&
+         resource.data.get('organizations', []).hasAny(claims().orgs.keys()));
+      // whatsappVerified feeds the JWT's whatsappVerified claim and the
+      // WhatsApp-sender -> Fello-user resolution; only the server-side OTP
+      // verification (Admin SDK, bypasses rules) may ever set it.
+      allow create: if isSelf(uid) &&
+        request.resource.data.get('whatsappVerified', false) == false;
+      allow update: if isSelf(uid) &&
+        request.resource.data.get('whatsappVerified', false)
+          == resource.data.get('whatsappVerified', false);
+      allow delete: if false;
+    }
+
+    // ---- tenants -----------------------------------------------------------
+    // `institutions` in CLAUDE.md's data model is aspirational — `tenants` is
+    // the collection actually read/written across the app (see lib/actions/auth.ts,
+    // lib/actions/organizations.ts, and every org-scoped dashboard page).
+    match /tenants/{domain} {
+      allow read: if signedIn();
+      allow write: if signedIn() && domain == request.auth.token.email.lower().split('@')[1];
+    }
+    // Unused — kept locked down rather than deleted in case a migration needs it.
+    match /institutions/{domain} {
+      allow read, write: if false;
+    }
+
+    // ---- organizations & structure ---------------------------------------
+    match /organizations/{orgId} {
+      // Must stay query-compatible: the org selector, setup pages and slug
+      // resolution all run where(tenantId==)/where(slug==)/where(id in ...)
+      // queries, and doc-id/membership-based rules can never be proven for a
+      // query (rules are not filters) — they'd deny every org list in the app.
+      // Org docs hold only display metadata (name/slug/logo/verified), no
+      // secrets, so any signed-in user may read them.
+      allow read: if signedIn();
+      allow create: if signedIn();
+      // Only admins/coordinators reshape or delete the org itself — a "team"
+      // or "readonly" member must never be able to rename/delete it.
+      allow update: if isOrgManager(orgId);
+      allow delete: if isOrgAdmin(orgId);
+    }
+    match /org_nodes/{nodeId} {
+      allow read: if isOrgMember(resource.data.orgId);
+      allow create: if isOrgManager(request.resource.data.orgId);
+      allow update, delete: if isOrgManager(resource.data.orgId);
+    }
+
+    // ---- members (directory display records, org-level) ------------------
+    match /members/{memberId} {
+      allow read: if isOrgMember(resource.data.orgId);
+      allow create, update: if isOrgManager(request.resource.data.orgId);
+      allow delete: if isOrgManager(resource.data.orgId);
+    }
+
+    // ---- memberships (org-level, full access) ------------------------
+    // Memberships are what access/capability claims are built from — letting
+    // any member write them is a privilege-escalation path. Admin/coordinator
+    // only; joining/accepting an invite is a server action (Admin SDK).
+    match /memberships/{membershipId} {
+      allow read: if signedIn() &&
+        (resource.data.userId == request.auth.uid || isOrgMember(resource.data.orgId));
+      allow create, update: if isOrgManager(request.resource.data.orgId);
+      allow delete: if isOrgManager(resource.data.orgId);
+    }
+
+    // ---- projects (also "events" — see fello-agent/skills/events.py) -----
+    match /projects/{projectId} {
+      allow read: if canAccessProject(resource.data.orgId, projectId);
+      allow create: if signedIn() && isOrgMember(request.resource.data.orgId);
+      // Guests never mutate project metadata, only its tasks/documents below.
+      allow update, delete: if isOrgMember(resource.data.orgId);
+    }
+
+    // ---- tasks (org members full access, project guests scoped) ----------
+    match /tasks/{taskId} {
+      allow read: if canAccessProject(resource.data.orgId, resource.data.projectId);
+      allow create: if canAccessProject(request.resource.data.orgId, request.resource.data.projectId);
+      allow update: if canAccessProject(resource.data.orgId, resource.data.projectId);
+      allow delete: if isOrgMember(resource.data.orgId);
+    }
+
+    // ---- project documents (Docs/Sheets/Slides/Forms stubs) --------------
+    match /project_documents/{docId} {
+      allow read: if canAccessProject(resource.data.orgId, resource.data.projectId);
+      allow write: if canAccessProject(request.resource.data.orgId, request.resource.data.projectId);
+    }
+
+    // ---- outreach / automations / event_summaries (org-only) -------------
+    match /outreach/{id} {
+      allow read, write: if isOrgMember(resource.data.orgId) ||
+        (request.method == 'create' && isOrgMember(request.resource.data.orgId));
+    }
+    match /automations/{id} {
+      allow read, write: if isOrgMember(resource.data.orgId) ||
+        (request.method == 'create' && isOrgMember(request.resource.data.orgId));
+    }
+    match /event_summaries/{id} {
+      allow read: if canAccessProject(resource.data.orgId, resource.data.projectId);
+      allow write: if isOrgMember(resource.data.orgId);
+    }
+
+    // ---- WhatsApp group registry (org-only) -------------------------------
+    match /whatsapp_groups/{id} {
+      allow read, write: if isOrgMember(resource.data.orgId) ||
+        (request.method == 'create' && isOrgMember(request.resource.data.orgId));
+    }
+
+    // ---- Google integrations (org-level and per-project) — never client-readable
+    // for the raw tokens; only server (Admin SDK) code should touch these in
+    // practice, but scope client access to org members for status display.
+    // These documents hold the org's raw Google OAuth access/refresh tokens.
+    // A refresh token here is full, Fello-independent access to the connected
+    // Google account (Drive, Gmail send, Calendar) — so ONLY org admins (who
+    // connect the account in the first place) may ever read or write them.
+    // Non-admin UI must treat a permission error as "not connected".
+    match /google_integrations/{orgId} {
+      allow read: if isOrgManager(orgId);
+      allow write: if isOrgAdmin(orgId);
+    }
+    match /project_google_integrations/{projectId} {
+      // Guests never see or manage the project's Google grant — Drive/Docs
+      // access happens exclusively through the agent's server-side skills.
+      allow read, write: if isOrgManager(resource.data.orgId) ||
+        (request.method == 'create' && isOrgManager(request.resource.data.orgId));
+    }
+
+    // ---- per-project WhatsApp gateway registry ----------------------------
+    match /project_whatsapp/{projectId} {
+      allow read: if canAccessProject(resource.data.orgId, projectId);
+      allow write: if isOrgMember(resource.data.orgId) ||
+        (request.method == 'create' && isOrgMember(request.resource.data.orgId));
+    }
+
+    // ---- org invites (email-based, resolved into a real membership on
+    // sign-in — see acceptPendingOrgInvites in lib/actions/org-invites.ts) ----
+    match /org_invites/{inviteId} {
+      // An org member manages every invite for their org; an invitee (who is
+      // NOT yet a member — that's the whole point) can read only their own
+      // pending invite, matched by their verified token email. This is what
+      // lets the org selector (/) and Directory pages show a pending invite
+      // before the user has ever joined the org.
+      allow read: if isOrgMember(resource.data.orgId) ||
+        (signedIn() && resource.data.inviteValue == request.auth.token.email);
+      // Invite creation always goes through a server action (Admin SDK,
+      // domain-validated) — never allow the client to mint one directly.
+      allow create: if false;
+      // Org members revoke invites (Members page); the invitee cannot self-
+      // mutate their own invite from the client — acceptance is a server
+      // action (bakes claims atomically with the membership write).
+      allow update: if isOrgMember(resource.data.orgId);
+      allow delete: if false;
+    }
+
+    // ---- Drive-scanned invite candidates (admin-approval queue) -----------
+    match /invite_suggestions/{suggestionId} {
+      allow read, write: if isOrgMember(resource.data.orgId) ||
+        (request.method == 'create' && isOrgMember(request.resource.data.orgId));
+    }
+
+    // ---- external/guest contributor invites --------------------------------
+    match /project_memberships/{membershipId} {
+      // A guest may read their own invite/membership doc; org members can
+      // read/manage every invite for their org's projects.
+      allow read: if signedIn() &&
+        (resource.data.contactId == request.auth.uid || isOrgMember(resource.data.orgId));
+      // Org members create/manage invites. A signed-in user may also accept
+      // their OWN pending invite (writing a doc keyed to their own uid, or
+      // deleting the synthetic-id placeholder that matches their verified
+      // email) — this is the self-service accept path, not an org action.
+      allow create, update: if isOrgMember(request.resource.data.orgId) ||
+        (signedIn() && request.resource.data.contactId == request.auth.uid);
+      allow delete: if isOrgMember(resource.data.orgId) ||
+        (signedIn() && resource.data.inviteValue == request.auth.token.email);
+    }
+
+    // ---- waitlist (public-facing, write-mostly) ---------------------------
+    match /waitlist_users/{email} {
+      allow read: if false;
+      allow create: if true;
+      allow update, delete: if false;
+    }
+    match /waitlists/{domain} {
+      allow read: if true;
+      allow write: if false; // only the server-side REST-API path increments this
+    }
+
+    // ---- config (read-only reference data) ---------------------------------
+    match /config/{doc} {
+      allow read: if true;
+      allow write: if false;
+    }
+
+    // ---- otp_verifications (server-only; Admin SDK bypasses rules anyway) --
+    match /otp_verifications/{phone} {
+      allow read, write: if false;
+    }
+
+    // Deny everything else by default (no catch-all open rule).
+  }
+}

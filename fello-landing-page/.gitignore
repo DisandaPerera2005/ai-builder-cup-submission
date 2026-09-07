@@ -1,0 +1,22 @@
+# Next.js
+.next/
+out/
+build/
+
+# Node
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Environment
+.env*.local
+
+# Cache
+.eslintcache
+tsconfig.tsbuildinfo
+
+# Firebase
+.firebase/
+firebase-debug.log*
