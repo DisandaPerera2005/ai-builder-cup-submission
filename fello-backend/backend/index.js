@@ -24,6 +24,7 @@ app.use('/', whatsappRoutes);
 app.use('/', driveSyncRoutes);
 
 const PORT = process.env.PORT || 8080;
-app.listen(PORT, () => {
-  console.log(`Fello backend listening on :${PORT}`);
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`Fello backend listening on 0.0.0.0:${PORT}`);
 });
+
